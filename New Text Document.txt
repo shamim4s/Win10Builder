@@ -1,0 +1,3 @@
+Remove-Item "C:\Win10Builder\Mount" -Recurse -Force
+
+dism /Unmount-Wim /MountDir:C:\Win10Builder\Mount /Discard

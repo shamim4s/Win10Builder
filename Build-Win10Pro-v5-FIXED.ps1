@@ -45,6 +45,10 @@ $OutputISO = Join-Path $Output 'Win10_22H2_Pro_en-US_19045.7663.iso'
 $Log = Join-Path $Logs ("Build-v5-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
 New-Item -ItemType Directory -Force -Path $ISOdir,$PkgDir,$Work,$Mount,$Output,$Logs | Out-Null
+if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+    Write-Host 'ERROR: Start this script from an elevated Administrator PowerShell.' -ForegroundColor Red
+    exit 740
+}
 Start-Transcript -Path $Log -Append | Out-Null
 
 function Say($m,[string]$c='Gray'){ Write-Host $m -ForegroundColor $c }
@@ -131,8 +135,8 @@ function Get-ISOUrlFromMicrosoft {
     $ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
     $session=New-Object Microsoft.PowerShell.Commands.WebRequestSession
     $h=@{'User-Agent'=$ua;'Accept-Language'='en-US,en;q=0.9'}
-    $home=Invoke-WebRetry -Uri $page -Headers $h -Session $session
-    $html=$home.Content
+    $isoPageResponse=Invoke-WebRetry -Uri $page -Headers $h -Session $session
+    $html=$isoPageResponse.Content
 
     $prod=[regex]::Match($html,'product-info-content.*?option\s+value="(\d+)"[^>]*>\s*Windows 10\s*<',[Text.RegularExpressions.RegexOptions]::Singleline)
     if(!$prod.Success){
@@ -280,10 +284,11 @@ try {
 
     Step 3 'Downloading Microsoft English x64 ISO when required'
     if(!$SourceISO){
+        $SourceISO = Join-Path $ISOdir 'Win10_22H2_English_US_x64.iso'
         Info 'Getting current Microsoft ISO URL from the live Windows 10 ISO page.'
         $url=Get-ISOUrlFromMicrosoft
         Info "Microsoft ISO URL obtained (time-limited)."
-        Download-Resumable -Url $url -Destination $SourceISO -Label 'Microsoft Windows 10 English x64 ISO' | Out-Null
+        Download-Resumable -Url $url -Destination $SourceISO -Label 'Microsoft Windows 10 English (United States) x64 ISO' | Out-Null
         $info=Get-ISOInfo $SourceISO
         if(!$info.Pro -or !$info.X64 -or $info.Lang -ne 'en-US'){throw 'Downloaded ISO failed en-US/x64/Pro validation.'}
         $h=Hash-File $SourceISO
@@ -336,7 +341,7 @@ try {
     Step 7 'Checking installed packages and servicing baseline'
     $pkgs=& dism.exe /Image:$Mount /Get-Packages 2>&1
     $pkgText=$pkgs -join "`n"
-    $hasBaseline=($pkgText -match 'KB5028244') -or ($pkgText -match 'KB5\d{6}' -and $pkgText -match '19045')
+    $hasBaseline=($pkgText -match 'KB5028244')
     if($pkgText -match 'KB5120249'){
         OK 'KB5120249 already present.'
     }else{
