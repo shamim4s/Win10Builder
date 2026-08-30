@@ -37,8 +37,8 @@ echo.
 :: ------------------------------------------------------------
 :: Verify script exists
 :: ------------------------------------------------------------
-if not exist "%~dp0Build-Win10Pro-v6.ps1" (
-    echo [ERROR] Build-Win10Pro-v6.ps1 was not found.
+if not exist "%~dp0Build-Win10Pro-v6-FIXED-4.ps1" (
+    echo [ERROR] Build-Win10Pro-v6-FIXED-4.ps1 was not found.
     echo.
     pause
     exit /b 1
@@ -52,7 +52,7 @@ echo.
 echo DO NOT CLOSE THIS WINDOW.
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Build-Win10Pro-v6-FIXED.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Build-Win10Pro-v6-FIXED-4.ps1"
 
 set "EXITCODE=%ERRORLEVEL%"
 

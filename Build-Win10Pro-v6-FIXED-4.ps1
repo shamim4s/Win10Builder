@@ -212,7 +212,7 @@ function Get-ImageMetadata {
         elseif ($line -match '^\s*Version\s*:\s*(.+)$') { $meta.Version = $matches[1].Trim() }
         elseif ($line -match '^\s*ServicePack Build\s*:\s*(.+)$') { $meta.Build = $matches[1].Trim() }
         elseif ($line -match '^\s*Edition\s*:\s*(.+)$') { $meta.Edition = $matches[1].Trim() }
-        elseif ($line -match '^\s{8}([a-z]{2}-[A-Z]{2})\s+\(') { $meta.Languages += $matches[1] }
+        elseif ($line -match '^\s+([a-z]{2}-[A-Z]{2})(?:\s|$)') { $meta.Languages += $matches[1] }
     }
 
     [pscustomobject]$meta
@@ -257,7 +257,7 @@ function Validate-SourceIso {
         }
 
         if ($meta.Version -notmatch '^10\.0\.19045') {
-            throw "Source Pro image is not Windows 10 22H2 (19045). Detected: $($meta.Version)"
+            throw "Source Pro image is not Windows 10 22H2 (19045). Detected Version=$($meta.Version), ServicePackBuild=$($meta.Build)"
         }
 
         Write-Log 'Existing ISO is a valid en-US x64 Windows 10 22H2 Pro source.' 'OK'
@@ -323,6 +323,33 @@ function Invoke-WebRetry {
     }
 }
 
+function Get-JsonPropertyValue {
+    param(
+        [Parameter(Mandatory=$true)][object]$Object,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+
+    return $prop.Value
+}
+
+function Get-MicrosoftApiErrors {
+    param([object]$Json)
+
+    foreach ($name in @('Errors','errors','Error','error','Message','message')) {
+        $value = Get-JsonPropertyValue -Object $Json -Name $name
+        if ($null -ne $value -and [string]$value) {
+            return [string]($value | ConvertTo-Json -Compress -Depth 10)
+        }
+    }
+
+    return $null
+}
+
 function Get-MicrosoftIsoUrl {
     $sessionId = [Guid]::NewGuid().ToString()
     $session = New-WebSession
@@ -361,22 +388,25 @@ function Get-MicrosoftIsoUrl {
 
     $skuJson = $skuResponse.Content | ConvertFrom-Json
 
-    if ($skuJson.Errors) {
-        Fail ("Microsoft SKU API error: " + ($skuJson.Errors | ConvertTo-Json -Compress))
+    $apiErrors = Get-MicrosoftApiErrors -Json $skuJson
+    if ($apiErrors) {
+        Fail ("Microsoft SKU API error: " + $apiErrors)
     }
 
-    if (-not $skuJson.Skus) {
-        Fail 'Microsoft SKU API returned no SKUs.'
+    $skus = Get-JsonPropertyValue -Object $skuJson -Name 'Skus'
+    if ($null -eq $skus) {
+        Fail ('Microsoft SKU API returned no SKUs. Raw response: ' + $skuResponse.Content)
     }
 
-    $sku = $skuJson.Skus | Where-Object {
-        $_.Language -eq $TargetLanguage -or $_.LocalizedLanguage -eq 'English (United States)'
+    $sku = $skus | Where-Object {
+        (Get-JsonPropertyValue -Object $_ -Name 'Language') -eq $TargetLanguage -or
+        (Get-JsonPropertyValue -Object $_ -Name 'LocalizedLanguage') -eq 'English (United States)'
     } | Select-Object -First 1
 
     if (-not $sku) {
         # Some releases return English as the language key but LocalizedLanguage as English (United States).
-        $sku = $skuJson.Skus | Where-Object {
-            $_.LocalizedLanguage -match 'English.*United States'
+        $sku = $skus | Where-Object {
+            (Get-JsonPropertyValue -Object $_ -Name 'LocalizedLanguage') -match 'English.*United States'
         } | Select-Object -First 1
     }
 
@@ -398,32 +428,88 @@ function Get-MicrosoftIsoUrl {
 
     $linkJson = $linkResponse.Content | ConvertFrom-Json
 
-    if ($linkJson.Errors) {
-        $err = $linkJson.Errors | ConvertTo-Json -Compress
+    $err = Get-MicrosoftApiErrors -Json $linkJson
+    if ($err) {
         if ($err -match 'SentinelReject') {
             Fail "Microsoft Sentinel rejected the ISO-link request. Wait and retry later. Response: $err"
         }
         Fail "Microsoft ISO link API error: $err"
     }
 
-    if (-not $linkJson.ProductDownloadOptions) {
-        Fail 'Microsoft ISO link API returned no download options.'
+    # Microsoft has changed the shape/naming of this JSON several times.
+    # Do not assume ProductDownloadOptions or DownloadType exists. Walk the
+    # complete response and collect URL-like strings, then select the x64 ISO.
+    $urlCandidates = New-Object System.Collections.Generic.List[string]
+
+    function Find-HttpUrls {
+        param([object]$Node)
+
+        if ($null -eq $Node) { return }
+
+        if ($Node -is [string]) {
+            foreach ($m in [regex]::Matches(
+                $Node,
+                'https?://[^\s"''<>\\]+',
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )) {
+                [void]$urlCandidates.Add($m.Value)
+            }
+            return
+        }
+
+        if ($Node -is [System.Collections.IEnumerable] -and
+            -not ($Node -is [System.Collections.IDictionary])) {
+            foreach ($item in $Node) {
+                Find-HttpUrls -Node $item
+            }
+            return
+        }
+
+        foreach ($prop in $Node.PSObject.Properties) {
+            Find-HttpUrls -Node $prop.Value
+        }
     }
 
-    $option = $linkJson.ProductDownloadOptions | Where-Object {
-        $_.DownloadType -match 'IsoX64|x64'
+    Find-HttpUrls -Node $linkJson
+
+    $urlCandidates = @(
+        $urlCandidates |
+        ForEach-Object {
+            $_ -replace '\\u0026','&' -replace '&amp;','&'
+        } |
+        Sort-Object -Unique
+    )
+
+    # First preference: URLs explicitly identifying x64/amd64 and ISO.
+    $optionUrl = $urlCandidates | Where-Object {
+        $_ -match '(?i)(x64|amd64|64-bit)' -and
+        $_ -match '(?i)\.iso(?:[?&]|$)'
     } | Select-Object -First 1
 
-    if (-not $option) {
-        Fail 'Microsoft API returned no x64 ISO option.'
+    # Second preference: any ISO URL. This handles Microsoft's newer response
+    # where architecture is represented by a sibling JSON property rather
+    # than encoded in the URL.
+    if (-not $optionUrl) {
+        $optionUrl = $urlCandidates | Where-Object {
+            $_ -match '(?i)\.iso(?:[?&]|$)'
+        } | Select-Object -First 1
     }
 
-    if (-not $option.Uri) {
-        Fail 'Microsoft API returned an x64 option without a URI.'
+    if (-not $optionUrl) {
+        $preview = $linkResponse.Content
+        if ($preview.Length -gt 4000) {
+            $preview = $preview.Substring(0,4000) + '...'
+        }
+        Fail ("Microsoft API returned no ISO download URL. Raw response: " + $preview)
     }
 
-    Write-Log 'Microsoft x64 ISO URL obtained. The generated URL is time-limited.' 'OK'
-    return [string]$option.Uri
+    # A JSON-escaped ampersand can survive into the URL depending on the
+    # connector response. Normalize it before returning it.
+    $optionUrl = [System.Net.WebUtility]::HtmlDecode([string]$optionUrl)
+    $optionUrl = $optionUrl -replace '\\u0026','&'
+
+    Write-Log 'Microsoft ISO download URL obtained. The generated URL is time-limited.' 'OK'
+    return [string]$optionUrl
 }
 
 # ----------------------------
@@ -661,24 +747,289 @@ function Get-MountedPackageNames {
     return ($out | Out-String)
 }
 
-function Add-Package {
-    param([string]$PackagePath, [string]$Label)
+function Get-MicrosoftIso {
+    [CmdletBinding()]
+    param(
+        [string]$TargetLanguage = 'en-US',
+        [string]$IsoDir = $(Join-Path $PSScriptRoot 'ISO'),
+        [int]$MaxApiAttempts = 3,
+        [int]$PollSeconds = 10,
+        [int]$MaxPollMinutes = 30
+    )
 
-    $packages = Get-MountedPackageNames
-    $kb = [IO.Path]::GetFileNameWithoutExtension($PackagePath)
+    Write-Section "3/12 - Obtaining Microsoft en-US x64 ISO"
+    Write-Log "No valid local source ISO was found. Microsoft download is required." 'INFO'
+    Write-Log "Target: Windows 10 22H2, Pro-capable media, en-US, x64." 'INFO'
 
-    if ($packages -match [regex]::Escape($kb)) {
-        Write-Log "$Label appears to already be installed; skipping."
-        return
+    if (-not (Test-Path $IsoDir)) {
+        New-Item -ItemType Directory -Path $IsoDir -Force | Out-Null
     }
 
-    Invoke-Native 'dism.exe' @(
-        "/Image:$MountDir",
-        '/Add-Package',
-        "/PackagePath:$PackagePath",
-        '/NoRestart'
-    ) "Injecting $Label"
+    $targetPath = Join-Path $IsoDir 'Win10_22H2_English_x64.iso'
+    $officialPage = 'https://www.microsoft.com/en-us/software-download/windows10iso'
+
+    function Test-ValidTargetIso {
+        param([string]$Path)
+
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return $false
+        }
+
+        try {
+            $size = (Get-Item -LiteralPath $Path).Length
+            if ($size -lt 100MB) {
+                return $false
+            }
+
+            $meta = Get-IsoProMetadata -IsoPath $Path
+            return (
+                $meta.Architecture -eq 'x64' -and
+                $meta.Edition -match 'Professional' -and
+                $meta.Languages -contains 'en-US' -and
+                (
+                    $meta.Version -match '^10\.0\.19045$' -or
+                    $meta.Build -eq '19045'
+                )
+            )
+        }
+        catch {
+            return $false
+        }
+    }
+
+    function Wait-ForValidIso {
+        param(
+            [string]$Path,
+            [int]$PollSeconds,
+            [int]$MaxPollMinutes
+        )
+
+        $deadline = (Get-Date).AddMinutes($MaxPollMinutes)
+        $lastSize = -1
+
+        while ((Get-Date) -lt $deadline) {
+            if (Test-ValidTargetIso -Path $Path) {
+                Write-Log "Validated Windows 10 22H2 en-US x64 Pro-capable ISO: $Path" 'OK'
+                return $true
+            }
+
+            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                try {
+                    $size = (Get-Item -LiteralPath $Path).Length
+                    if ($size -ne $lastSize) {
+                        Write-Log ("Waiting for ISO download/validation. Current size: {0:N0} bytes" -f $size) 'INFO'
+                        $lastSize = $size
+                    }
+                } catch {}
+            }
+
+            Start-Sleep -Seconds $PollSeconds
+        }
+
+        return $false
+    }
+
+    # First, retry the connector with fresh sessions. SentinelReject is a
+    # Microsoft-side anti-abuse decision, so retrying with a fresh session is
+    # useful, but the script must never treat it as a parsing failure.
+    $apiSucceeded = $false
+
+    for ($attempt = 1; $attempt -le $MaxApiAttempts; $attempt++) {
+        try {
+            Write-Log "Microsoft connector attempt $attempt/$MaxApiAttempts." 'INFO'
+
+            $sessionId = [guid]::NewGuid().Guid
+            $headers = @{
+                'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+                'Accept' = 'application/json, text/plain, */*'
+                'Referer' = 'https://www.microsoft.com/en-us/software-download/windows10iso'
+            }
+
+            $profile = '606624d44113'
+            $productEditionId = '2618'
+
+            # Establish the Microsoft session.
+            $sessionUrls = @(
+                "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=$sessionId",
+                "https://ov-df.microsoft.com/mdt.js?instanceId=560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175&PageId=si&session_id=$sessionId",
+                "https://ov-df.microsoft.com/?session_id=$sessionId&CustomerId=560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175&PageId=si"
+            )
+
+            foreach ($u in $sessionUrls) {
+                try {
+                    Invoke-WebRequest -Uri $u -Headers $headers -UseBasicParsing -TimeoutSec 30 | Out-Null
+                } catch {
+                    Write-Log "Session bootstrap request failed (non-fatal): $($_.Exception.Message)" 'WARN'
+                }
+            }
+
+            $skuUrl = "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=$profile&ProductEditionId=$productEditionId&SKU=undefined&friendlyFileName=undefined&Locale=en-US&sessionID=$sessionId"
+            $skuResp = Invoke-WebRequest -Uri $skuUrl -Headers $headers -UseBasicParsing -TimeoutSec 45
+            $skuJson = $skuResp.Content | ConvertFrom-Json
+
+            $skus = Get-JsonPropertyValue -Object $skuJson -Name 'Skus'
+            $sku = $skus | Where-Object {
+                (Get-JsonPropertyValue -Object $_ -Name 'Language') -eq $TargetLanguage -or
+                (Get-JsonPropertyValue -Object $_ -Name 'LocalizedLanguage') -match 'English.*United States'
+            } | Select-Object -First 1
+
+            if (-not $sku) {
+                throw "Microsoft SKU API did not return an en-US SKU."
+            }
+
+            $skuId = Get-JsonPropertyValue -Object $sku -Name 'SKU'
+            if (-not $skuId) {
+                $skuId = Get-JsonPropertyValue -Object $sku -Name 'Sku'
+            }
+            if (-not $skuId) {
+                throw "Microsoft en-US SKU object did not contain a SKU identifier."
+            }
+
+            Write-Log "Microsoft en-US SKU: $skuId" 'OK'
+
+            $linkUrl = "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=$profile&ProductEditionId=undefined&SKU=$skuId&friendlyFileName=undefined&Locale=en-US&sessionID=$sessionId"
+            $linkResp = Invoke-WebRequest -Uri $linkUrl -Headers $headers -UseBasicParsing -TimeoutSec 60
+            $linkJson = $linkResp.Content | ConvertFrom-Json
+
+            $apiError = Get-MicrosoftApiErrors -Json $linkJson
+            if ($apiError) {
+                if ($apiError -match 'SentinelReject') {
+                    Write-Log "Microsoft Sentinel rejected connector attempt $attempt." 'WARN'
+                    throw "SentinelReject"
+                }
+                throw "Microsoft download-link API error: $apiError"
+            }
+
+            # Recursively collect URLs because Microsoft has changed the
+            # connector JSON structure more than once.
+            $urls = New-Object System.Collections.Generic.List[string]
+
+            function Find-Urls {
+                param([object]$Node)
+                if ($null -eq $Node) { return }
+
+                if ($Node -is [string]) {
+                    foreach ($match in [regex]::Matches($Node, 'https?://[^\s"''<>\\]+', 'IgnoreCase')) {
+                        [void]$urls.Add($match.Value)
+                    }
+                    return
+                }
+
+                if ($Node -is [System.Collections.IEnumerable] -and
+                    -not ($Node -is [System.Collections.IDictionary])) {
+                    foreach ($item in $Node) { Find-Urls $item }
+                    return
+                }
+
+                foreach ($p in $Node.PSObject.Properties) {
+                    Find-Urls $p.Value
+                }
+            }
+
+            Find-Urls $linkJson
+
+            $isoUrl = $urls |
+                ForEach-Object { $_ -replace '\\u0026','&' } |
+                Sort-Object -Unique |
+                Where-Object { $_ -match '(?i)\.iso(?:[?&]|$)' } |
+                Where-Object { $_ -match '(?i)(x64|amd64|64-bit)' } |
+                Select-Object -First 1
+
+            if (-not $isoUrl) {
+                $isoUrl = $urls |
+                    ForEach-Object { $_ -replace '\\u0026','&' } |
+                    Sort-Object -Unique |
+                    Where-Object { $_ -match '(?i)\.iso(?:[?&]|$)' } |
+                    Select-Object -First 1
+            }
+
+            if (-not $isoUrl) {
+                throw "Microsoft connector returned no usable ISO URL."
+            }
+
+            $isoUrl = [System.Net.WebUtility]::HtmlDecode([string]$isoUrl)
+            $isoUrl = $isoUrl -replace '\\u0026','&'
+
+            Write-Log "Microsoft ISO URL obtained." 'OK'
+            Write-Log "Starting ISO download to $targetPath" 'INFO'
+
+            if (Test-Path -LiteralPath $targetPath) {
+                Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+            }
+
+            Invoke-WebRequest -Uri $isoUrl -OutFile $targetPath -UseBasicParsing -TimeoutSec 3600
+
+            if (Test-ValidTargetIso -Path $targetPath) {
+                Write-Log "Downloaded ISO passed validation." 'OK'
+                return $targetPath
+            }
+
+            Write-Log "Downloaded file was not a valid target ISO; deleting it." 'WARN'
+            Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Log "Microsoft connector attempt $attempt failed: $($_.Exception.Message)" 'WARN'
+        }
+
+        if ($attempt -lt $MaxApiAttempts) {
+            Write-Log "Waiting 20 seconds before the next Microsoft session." 'INFO'
+            Start-Sleep -Seconds 20
+        }
+    }
+
+    # Official Microsoft page fallback. This is deliberately interactive:
+    # the page generates a time-limited download after the user selects the
+    # requested edition/language/architecture. We do not scrape/bypass
+    # Microsoft's anti-bot controls.
+    Write-Section "3A/12 - Official Microsoft download fallback"
+    Write-Log "Microsoft's connector did not provide a usable ISO URL." 'WARN'
+    Write-Log "Opening the official Microsoft Windows 10 ISO page." 'INFO'
+    Write-Log "Select Windows 10 22H2, English (United States), 64-bit and save the ISO as:" 'INFO'
+    Write-Log $targetPath 'INFO'
+
+    try {
+        Start-Process $officialPage | Out-Null
+    }
+    catch {
+        Write-Log "Could not open the browser automatically: $($_.Exception.Message)" 'WARN'
+    }
+
+    Write-Log "Polling $IsoDir for a valid ISO for up to $MaxPollMinutes minutes." 'INFO'
+    Write-Log "The builder will NOT continue until the ISO passes en-US/x64/22H2/Pro validation." 'INFO'
+
+    if (Wait-ForValidIso -Path $targetPath -PollSeconds $PollSeconds -MaxPollMinutes $MaxPollMinutes) {
+        return $targetPath
+    }
+
+    # Also scan the directory in case the user saved it under another name.
+    Write-Log "Target filename was not found/validated. Re-scanning the ISO directory." 'INFO'
+    $candidates = Get-ChildItem -LiteralPath $IsoDir -Filter '*.iso' -File -ErrorAction SilentlyContinue
+
+    foreach ($candidate in $candidates) {
+        if (Test-ValidTargetIso -Path $candidate.FullName) {
+            Write-Log "Found and validated Microsoft ISO: $($candidate.FullName)" 'OK'
+            return $candidate.FullName
+        }
+    }
+
+    throw @"
+No valid Windows 10 22H2 en-US x64 Pro-capable ISO was obtained.
+
+Microsoft's connector was unavailable/rejected the automated request.
+Use the official Microsoft page:
+$officialPage
+
+Save the resulting ISO in:
+$IsoDir
+
+Expected:
+- Windows 10 22H2
+- English (United States)
+- x64
+- Pro-capable installation media
+"@
 }
+
 
 # ----------------------------
 # Main
@@ -687,6 +1038,11 @@ New-Directories
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogFile = Join-Path $LogDir "Build-v6-$timestamp.log"
+
+# These are referenced by the outer finally block; initialize them because
+# Set-StrictMode -Version 2.0 treats an unset variable as a terminating error.
+$sourceIso = $null
+$disk = $null
 
 try {
     Write-Host ''
@@ -968,7 +1324,7 @@ catch {
     exit 1
 }
 finally {
-    if ($disk) {
+    if ($null -ne $disk -and $null -ne $sourceIso) {
         try { Dismount-DiskImage -ImagePath $sourceIso -ErrorAction SilentlyContinue | Out-Null } catch {}
     }
 }
