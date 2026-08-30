@@ -1,2 +1,7 @@
 # Windows 10 ISO
 ISO/*.iso
+Logs/
+Mount/
+Output/
+Packages/
+Work/
