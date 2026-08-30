@@ -1,0 +1,50 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260831020000
+Username: WINDOWS-331\CAD2
+RunAs User: WINDOWS-331\CAD2
+Configuration Name: 
+Machine: WINDOWS-331 (Microsoft Windows NT 10.0.19045.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Win10Builder\Build-Win10Pro-v4.ps1
+Process ID: 5348
+PSVersion: 5.1.19041.6456
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.6456
+BuildVersion: 10.0.19041.6456
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Running as Administrator.
+
+================================================================
+1/12 - Checking local tools
+================================================================
+[OK] oscdimg: C:\Win10Builder\Tools\Oscdimg\oscdimg.exe
+[OK] UEFI: C:\Win10Builder\Tools\Oscdimg\efisys.bin
+[OK] BIOS: C:\Win10Builder\Tools\Oscdimg\etfsboot.com
+
+================================================================
+2/12 - Checking autounattend.xml
+================================================================
+[OK] autounattend.xml found
+
+================================================================
+3/12 - Validating existing ISO before any download
+================================================================
+[INFO] ISO: C:\Win10Builder\ISO\Win10_22H2_English_x64.iso
+[INFO] ISO SHA-256: A63DB059B6EEF003ABA9BAD94CD5B54C139F2084569934E05BD47351EE05977B
+[WARN] ISO hash differs from Microsoft current published English x64 hash; content will be inspected.
+[WARN] Source image is not x64.
+
+================================================================
+4/12 - Preparing clean workspace
+================================================================
+[INFO] ...
+PS>TerminatingError(): " failed: DISM exit 87"
+>> TerminatingError(): " failed: DISM exit 87"
+
+BUILD FAILED
+ failed: DISM exit 87
+Log: C:\Win10Builder\Logs\Build-v4-20260831-020000.log
